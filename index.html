@@ -87,11 +87,18 @@ const WALL_TH      = 28;
 const JOY_RADIUS   = 80;
 
 // Combat
-const ATK_CD       = 22;     // frames between shots
-const PROJ_SPEED   = 12;
-const PROJ_R       = 7;
-const PROJ_TTL     = 80;
-const BUMPER_PUSH  = 5;      // velocity added to each player on collision
+const ATK_CD          = 22;   // frames between shots
+const PROJ_SPEED      = 12;
+const PROJ_R          = 7;
+const PROJ_TTL        = 80;
+const BUMPER_PUSH     = 5;
+// Charge attack
+const CHARGE_THRESHOLD = 18;  // frames held before shot becomes explosive
+const CHARGE_MAX       = 60;  // frames to fully charge (caps explosion size)
+const EXPLOSION_R_MIN  = 70;  // explosion radius at min charge
+const EXPLOSION_R_MAX  = 130; // explosion radius at max charge
+const EXPLOSION_TTL    = 24;
+const CHARGE_PROJ_SPEED = 9;  // explosive projectile is slower than normal
 
 // Match
 const ROUNDS_TO_WIN = 3;     // best of 5
@@ -129,10 +136,10 @@ let players = [], switches = [], traps = [], projectiles = [];
 let roundScores = [0, 0];
 
 // ── Input ──────────────────────────────────────────────────────────────────
-// dx,dy = movement vector; ax,ay = aim direction (unit-ish); fire = true if attacking
-const myInp     = { dx:0, dy:0, ax:0, ay:0, fire:false };
-const remoteInp = { dx:0, dy:0, ax:0, ay:0, fire:false };
-const localP2   = { dx:0, dy:0, ax:0, ay:0, fire:false };
+// dx,dy = movement vector; ax,ay = aim direction (unit-ish); aiming = true while charging/holding
+const myInp     = { dx:0, dy:0, ax:0, ay:0, aiming:false };
+const remoteInp = { dx:0, dy:0, ax:0, ay:0, aiming:false };
+const localP2   = { dx:0, dy:0, ax:0, ay:0, aiming:false };
 const kbd1      = { l:false, r:false, u:false, d:false, atk:false };
 const kbd2      = { l:false, r:false, u:false, d:false, atk:false };
 
@@ -206,7 +213,7 @@ function startHost() {
       if (d && d.type==='input') {
         remoteInp.dx=+d.dx||0; remoteInp.dy=+d.dy||0;
         remoteInp.ax=+d.ax||0; remoteInp.ay=+d.ay||0;
-        remoteInp.fire=!!d.fire;
+        remoteInp.aiming=!!d.aiming;
       }
       if (d && d.type==='restart' && gstate==='matchOver') resetMatch();
     });
@@ -255,7 +262,12 @@ function setupRound(keepScores) {
 }
 
 function mkPlayer(x, y, color, name) {
-  return { x, y, r:20, vx:0, vy:0, color, name, hp:3, hitFl:0, dead:false, facing:0, atkCd:0 };
+  return {
+    x, y, r:20, vx:0, vy:0, color, name,
+    hp:3, hitFl:0, dead:false,
+    facing:0, atkCd:0,
+    aimFrames:0, aimX:1, aimY:0,
+  };
 }
 
 function endRound(winnerName) {
@@ -366,38 +378,34 @@ function kbdVec(k) {
 }
 
 function applyInput() {
-  // Default everything
-  myInp.dx=0; myInp.dy=0; myInp.ax=0; myInp.ay=0; myInp.fire=false;
+  myInp.dx=0; myInp.dy=0; myInp.ax=0; myInp.ay=0; myInp.aiming=false;
 
-  // Keyboard contribution (always available for testing)
+  // Keyboard contribution
   const kv = kbdVec(kbd1);
   myInp.dx = kv.dx; myInp.dy = kv.dy;
   if (kbd1.atk) {
-    // Aim in current movement direction; if not moving, aim up
     let ax = kv.dx, ay = kv.dy;
     if (!ax && !ay) {
       const me = players[myIdx];
       ax = me ? Math.cos(me.facing) : 1;
       ay = me ? Math.sin(me.facing) : 0;
     }
-    myInp.ax = ax; myInp.ay = ay; myInp.fire = true;
+    myInp.ax = ax; myInp.ay = ay; myInp.aiming = true;
   }
 
   if (myRole !== 'local') {
-    // Touch joysticks: L = movement, R = aim+fire
     let leftRec = null, rightRec = null;
     for (const [, rec] of activeTouches) {
       if (rec.side === 'L') leftRec = rec;
       else                  rightRec = rec;
     }
-    // Mouse drag (desktop) acts as left joystick if present
     if (!leftRec && mouseDownPt) leftRec = mouseDownPt;
 
     if (leftRec) { const v = joyVec(leftRec); if (v.mag) { myInp.dx = v.dx; myInp.dy = v.dy; } }
     if (rightRec) {
+      // Right joystick HELD = charging. Release fires the shot.
+      myInp.aiming = true;
       const v = joyVec(rightRec);
-      // Holding right joystick = firing. Aim: drag direction, or facing if barely moved.
-      myInp.fire = true;
       if (v.mag) { myInp.ax = v.dx; myInp.ay = v.dy; }
       else {
         const me = players[myIdx];
@@ -410,7 +418,7 @@ function applyInput() {
   if (myRole === 'local') {
     const k2 = kbdVec(kbd2);
     localP2.dx = k2.dx; localP2.dy = k2.dy;
-    localP2.fire = !!kbd2.atk;
+    localP2.aiming = !!kbd2.atk;
     if (kbd2.atk) {
       let ax = k2.dx, ay = k2.dy;
       if (!ax && !ay) {
@@ -456,33 +464,83 @@ function updatePlayer(p, inp) {
   if (p.dead) return;
   if (p.hitFl > 0) p.hitFl--;
   if (p.atkCd > 0) p.atkCd--;
-  // Knockback decay
   p.vx *= 0.84; p.vy *= 0.84;
   if (Math.abs(p.vx) < 0.05) p.vx = 0;
   if (Math.abs(p.vy) < 0.05) p.vy = 0;
-  // Aim direction takes priority for facing; movement direction otherwise
+
   if (Math.hypot(inp.ax, inp.ay) > 0.1) p.facing = Math.atan2(inp.ay, inp.ax);
   else if (Math.hypot(inp.dx, inp.dy) > 0.1) p.facing = Math.atan2(inp.dy, inp.dx);
-  const mvx = inp.dx * SPEED + p.vx;
-  const mvy = inp.dy * SPEED + p.vy;
-  collideMove(p, mvx, mvy);
 
-  // Fire
-  if (inp.fire && p.atkCd === 0) {
-    const ax = inp.ax || Math.cos(p.facing);
-    const ay = inp.ay || Math.sin(p.facing);
-    const m = Math.hypot(ax, ay) || 1;
+  // Charging logic: hold = build charge, release = fire (tap = quick weak shot)
+  const wasCharging = p.aimFrames > 0;
+  const canCharge   = inp.aiming && p.atkCd === 0;
+  if (canCharge) {
+    p.aimFrames++;
+    p.aimX = inp.ax || Math.cos(p.facing);
+    p.aimY = inp.ay || Math.sin(p.facing);
+  } else if (wasCharging) {
+    const charge = Math.min(p.aimFrames, CHARGE_MAX);
+    fireShot(p, charge);
+    p.aimFrames = 0;
+    p.atkCd = ATK_CD;
+  }
+
+  // Slow movement slightly while charging — committing to a shot has a cost
+  const speedMul = (canCharge && p.aimFrames > 4) ? 0.55 : 1;
+  const mvx = inp.dx * SPEED * speedMul + p.vx;
+  const mvy = inp.dy * SPEED * speedMul + p.vy;
+  collideMove(p, mvx, mvy);
+}
+
+function fireShot(p, charge) {
+  const ax = p.aimX || Math.cos(p.facing);
+  const ay = p.aimY || Math.sin(p.facing);
+  const m  = Math.hypot(ax, ay) || 1;
+  const nx = ax / m, ny = ay / m;
+  const explosive = charge >= CHARGE_THRESHOLD;
+  if (explosive) {
+    const power = charge / CHARGE_MAX; // 0..1
     projectiles.push({
-      x: p.x + (ax/m)*(p.r+6),
-      y: p.y + (ay/m)*(p.r+6),
-      vx: (ax/m) * PROJ_SPEED,
-      vy: (ay/m) * PROJ_SPEED,
+      x: p.x + nx * (p.r + 12),
+      y: p.y + ny * (p.r + 12),
+      vx: nx * CHARGE_PROJ_SPEED,
+      vy: ny * CHARGE_PROJ_SPEED,
+      ttl: 110,
+      owner: p.name,
+      color: '#ffaa00',
+      explosive: true,
+      r: 11 + power * 6,
+      power,
+    });
+  } else {
+    projectiles.push({
+      x: p.x + nx * (p.r + 6),
+      y: p.y + ny * (p.r + 6),
+      vx: nx * PROJ_SPEED,
+      vy: ny * PROJ_SPEED,
       ttl: PROJ_TTL,
       owner: p.name,
       color: p.color,
+      explosive: false,
+      r: PROJ_R,
+      power: 0,
     });
-    p.atkCd = ATK_CD;
   }
+}
+
+function explodeAt(x, y, power, ownerName) {
+  const r = EXPLOSION_R_MIN + (EXPLOSION_R_MAX - EXPLOSION_R_MIN) * power;
+  for (const p of players) {
+    if (p.dead) continue;
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < r + p.r) {
+      const ang = Math.atan2(p.y - y, p.x - x);
+      // Damage falls off slightly with distance, but always at least 1
+      damagePlayer(p, Math.cos(ang), Math.sin(ang), 12 + power * 4);
+    }
+  }
+  traps.push({ type:'explosion', x: x - r, y: y - r, w: r*2, h: r*2, vx:0, vy:0, ttl: EXPLOSION_TTL });
+  shake = Math.max(shake, 18);
 }
 
 // Bumper push — players knock each other on contact, no damage
@@ -508,27 +566,31 @@ function updateProjectiles() {
   for (let i = projectiles.length - 1; i >= 0; i--) {
     const pr = projectiles[i];
     pr.x += pr.vx; pr.y += pr.vy; pr.ttl--;
-    // Out of room?
-    if (pr.x < ROOM.x || pr.x > ROOM.x+ROOM.w || pr.y < ROOM.y || pr.y > ROOM.y+ROOM.h) { projectiles.splice(i,1); continue; }
-    // Pillar?
-    let hitPillar = false;
-    for (const o of PILLARS) {
-      if (pr.x > o.x && pr.x < o.x+o.w && pr.y > o.y && pr.y < o.y+o.h) { hitPillar = true; break; }
-    }
-    if (hitPillar) { projectiles.splice(i,1); continue; }
-    // Player?
-    let hitPlayer = false;
-    for (const p of players) {
-      if (p.dead || p.name === pr.owner) continue;
-      const d = Math.hypot(p.x - pr.x, p.y - pr.y);
-      if (d < p.r + PROJ_R) {
-        damagePlayer(p, pr.vx, pr.vy, 5);
-        hitPlayer = true;
-        break;
+
+    let hit = false, hitPlayer = null;
+    if (pr.x < ROOM.x || pr.x > ROOM.x+ROOM.w || pr.y < ROOM.y || pr.y > ROOM.y+ROOM.h) hit = true;
+    if (!hit) {
+      for (const o of PILLARS) {
+        if (pr.x > o.x && pr.x < o.x+o.w && pr.y > o.y && pr.y < o.y+o.h) { hit = true; break; }
       }
     }
-    if (hitPlayer) { projectiles.splice(i,1); continue; }
-    if (pr.ttl <= 0) projectiles.splice(i,1);
+    if (!hit) {
+      for (const p of players) {
+        if (p.dead || p.name === pr.owner) continue;
+        const d = Math.hypot(p.x - pr.x, p.y - pr.y);
+        if (d < p.r + (pr.r || PROJ_R)) { hit = true; hitPlayer = p; break; }
+      }
+    }
+    if (pr.ttl <= 0) hit = true;
+
+    if (hit) {
+      if (pr.explosive) {
+        explodeAt(pr.x, pr.y, pr.power || 0, pr.owner);
+      } else if (hitPlayer) {
+        damagePlayer(hitPlayer, pr.vx, pr.vy, 5);
+      }
+      projectiles.splice(i, 1);
+    }
   }
 }
 
@@ -667,10 +729,10 @@ function hostSend() {
   if(!conn||!conn.open) return;
   conn.send({
     type:'state',
-    ps:  players.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,hp:p.hp,hitFl:p.hitFl,facing:p.facing,dead:p.dead,atkCd:p.atkCd})),
+    ps:  players.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,hp:p.hp,hitFl:p.hitFl,facing:p.facing,dead:p.dead,atkCd:p.atkCd,aimFrames:p.aimFrames||0,aimX:p.aimX||0,aimY:p.aimY||0})),
     sw:  switches.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,cd:s.cd})),
     tr:  traps.map(t=>({type:t.type,x:t.x,y:t.y,w:t.w,h:t.h,vx:t.vx||0,vy:t.vy||0,ttl:t.ttl,warn:t.warn||0})),
-    pj:  projectiles.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,ttl:p.ttl,color:p.color,owner:p.owner})),
+    pj:  projectiles.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,ttl:p.ttl,color:p.color,owner:p.owner,explosive:!!p.explosive,r:p.r||PROJ_R,power:p.power||0})),
     sc:  roundScores,
     re:  roundEndFrame,
     f:   frame,
@@ -679,13 +741,13 @@ function hostSend() {
 }
 function guestSend() {
   if(!conn||!conn.open) return;
-  conn.send({ type:'input', dx:myInp.dx, dy:myInp.dy, ax:myInp.ax, ay:myInp.ay, fire:myInp.fire });
+  conn.send({ type:'input', dx:myInp.dx, dy:myInp.dy, ax:myInp.ax, ay:myInp.ay, aiming:myInp.aiming });
 }
 function applyState(d) {
   if (Array.isArray(d.ps)) d.ps.forEach((s,i)=>{ if(players[i]) Object.assign(players[i],s); });
   if (Array.isArray(d.sw)) switches = d.sw.map(s=>({x:+s.x,y:+s.y,w:+s.w,h:+s.h,cd:+s.cd}));
   if (Array.isArray(d.tr)) traps = d.tr.map(t=>({type:t.type,x:+t.x,y:+t.y,w:+t.w,h:+t.h,vx:+t.vx||0,vy:+t.vy||0,ttl:+t.ttl,warn:+t.warn||0,hits:new Set()}));
-  if (Array.isArray(d.pj)) projectiles = d.pj.map(p=>({x:+p.x,y:+p.y,vx:+p.vx,vy:+p.vy,ttl:+p.ttl,color:p.color,owner:p.owner}));
+  if (Array.isArray(d.pj)) projectiles = d.pj.map(p=>({x:+p.x,y:+p.y,vx:+p.vx,vy:+p.vy,ttl:+p.ttl,color:p.color,owner:p.owner,explosive:!!p.explosive,r:+p.r||PROJ_R,power:+p.power||0}));
   if (Array.isArray(d.sc)) roundScores = [+d.sc[0]||0, +d.sc[1]||0];
   if (typeof d.re === 'number') roundEndFrame = d.re;
   if (typeof d.f  === 'number') frame = d.f;
@@ -806,32 +868,90 @@ function drawTrap(t) {
       ctx.beginPath(); ctx.arc(t.x+Math.cos(ang)*r, t.y+Math.sin(ang)*r, 4, 0, Math.PI*2); ctx.fill();
     }
     ctx.restore();
+  } else if (t.type === 'explosion') {
+    const a = Math.max(0, t.ttl / EXPLOSION_TTL);
+    const r = t.w / 2;
+    const cx = t.x + r, cy = t.y + r;
+    const grow = 1 + (1 - a) * 0.35;
+    ctx.save();
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * grow);
+    g.addColorStop(0,    `rgba(255,255,210,${0.95*a})`);
+    g.addColorStop(0.45, `rgba(255,170,40,${0.65*a})`);
+    g.addColorStop(0.85, `rgba(255,80,0,${0.35*a})`);
+    g.addColorStop(1,    `rgba(255,40,0,0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, r * grow, 0, Math.PI*2); ctx.fill();
+    // Bright core
+    ctx.fillStyle = `rgba(255,255,255,${0.8*a})`;
+    ctx.beginPath(); ctx.arc(cx, cy, r*0.18, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
   }
 }
 
 function drawProjectile(pr) {
+  const r = pr.r || PROJ_R;
   ctx.save();
-  ctx.shadowColor = pr.color; ctx.shadowBlur = 12;
+  ctx.shadowColor = pr.color; ctx.shadowBlur = pr.explosive ? 22 : 12;
   ctx.fillStyle = pr.color;
-  ctx.beginPath(); ctx.arc(pr.x, pr.y, PROJ_R, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(pr.x, pr.y, r, 0, Math.PI*2); ctx.fill();
   ctx.restore();
-  ctx.fillStyle = '#fff';
-  ctx.beginPath(); ctx.arc(pr.x, pr.y, PROJ_R*0.4, 0, Math.PI*2); ctx.fill();
+  if (pr.explosive) {
+    // Pulsing inner core to telegraph "this thing is going to BOOM"
+    const pulse = 0.6 + Math.sin(frame*0.6)*0.4;
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.beginPath(); ctx.arc(pr.x, pr.y, r*0.55, 0, Math.PI*2); ctx.fill();
+    // Sparking trail
+    ctx.fillStyle = '#ffdd44';
+    for (let i=0; i<3; i++) {
+      const ox = -pr.vx*0.4 + (Math.random()-0.5)*4;
+      const oy = -pr.vy*0.4 + (Math.random()-0.5)*4;
+      ctx.beginPath(); ctx.arc(pr.x+ox, pr.y+oy, 2, 0, Math.PI*2); ctx.fill();
+    }
+  } else {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(pr.x, pr.y, r*0.4, 0, Math.PI*2); ctx.fill();
+  }
 }
 
-function drawAimLine(p, inp) {
-  if (!inp.fire) return;
-  const ax = inp.ax || Math.cos(p.facing);
-  const ay = inp.ay || Math.sin(p.facing);
-  const m = Math.hypot(ax, ay) || 1;
+function drawAimAndCharge(p) {
+  if (p.aimFrames <= 0) return;
+  const ax = p.aimX || Math.cos(p.facing);
+  const ay = p.aimY || Math.sin(p.facing);
+  const m  = Math.hypot(ax, ay) || 1;
   const dx = ax/m, dy = ay/m;
+  const charge = Math.min(p.aimFrames, CHARGE_MAX);
+  const charged = p.aimFrames >= CHARGE_THRESHOLD;
+  // Aim line
   ctx.save();
-  ctx.strokeStyle = p.color; ctx.lineWidth = 3;
-  ctx.globalAlpha = 0.4; ctx.setLineDash([6, 8]);
+  ctx.strokeStyle = charged ? '#ffdd44' : p.color;
+  ctx.lineWidth = charged ? 4 : 3;
+  ctx.globalAlpha = charged ? 0.65 : 0.45;
+  ctx.setLineDash([6, 8]);
   ctx.beginPath();
   ctx.moveTo(p.x + dx*p.r, p.y + dy*p.r);
-  ctx.lineTo(p.x + dx*180, p.y + dy*180);
+  ctx.lineTo(p.x + dx*200, p.y + dy*200);
   ctx.stroke();
+  ctx.restore();
+  // Charge ring around player
+  ctx.save();
+  if (charged) {
+    const pulse = 0.7 + Math.sin(frame*0.6)*0.3;
+    ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 22;
+    ctx.strokeStyle = `rgba(255,210,60,${pulse})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 7, 0, Math.PI*2); ctx.stroke();
+    // Inner pulse arc grows further with charge
+    const extra = (charge - CHARGE_THRESHOLD) / (CHARGE_MAX - CHARGE_THRESHOLD);
+    ctx.strokeStyle = `rgba(255,255,200,${0.4 + extra*0.4})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 12 + extra*6, 0, Math.PI*2); ctx.stroke();
+  } else {
+    ctx.strokeStyle = p.color;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r + 5, -Math.PI/2, -Math.PI/2 + Math.PI*2*(charge/CHARGE_THRESHOLD));
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -994,9 +1114,8 @@ function loop() {
   drawPillars();
   traps.forEach(drawTrap);
   projectiles.forEach(drawProjectile);
-  // Aim line for the local player while firing
-  const me = players[myIdx];
-  if (me && !me.dead) drawAimLine(me, myInp);
+  // Aim line + charge ring for any actively-charging player (so opponent sees the threat)
+  players.forEach(p => { if (!p.dead) drawAimAndCharge(p); });
   players.forEach(drawPlayer);
   drawJoysticks();
   drawHUD();
