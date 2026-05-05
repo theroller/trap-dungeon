@@ -117,7 +117,7 @@ const SWITCH_POS = [
 ];
 
 const EFFECTS = ['spikes', 'blade', 'wallClose', 'darts', 'shock', 'heal'];
-const SWITCH_COLORS = ['#ff4488', '#44ddff', '#ffdd44', '#88ff44', '#ff8844', '#aa44ff'];
+const MYSTERY_COLOR = '#a855ff';   // every switch looks the same — pure mystery
 
 // ── Role / net ─────────────────────────────────────────────────────────────
 let myRole = null, myIdx = 0, peer = null, conn = null;
@@ -126,7 +126,6 @@ let myRole = null, myIdx = 0, peer = null, conn = null;
 let gstate = 'lobby';    // lobby | playing | roundOver | matchOver
 let frame = 0, shake = 0, winner = null, roundEndFrame = 0;
 let players = [], switches = [], traps = [], projectiles = [];
-let switchEffectMap = {};
 let roundScores = [0, 0];
 
 // ── Input ──────────────────────────────────────────────────────────────────
@@ -245,13 +244,8 @@ function setupRound(keepScores) {
   traps = [];
   projectiles = [];
 
-  // Random switch → effect map every round (the "memorise" mechanic)
-  const eff = [...EFFECTS];
-  for (let i=eff.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [eff[i],eff[j]]=[eff[j],eff[i]]; }
-  switchEffectMap = {};
-  SWITCH_COLORS.forEach((c,i) => { switchEffectMap[c] = eff[i % eff.length]; });
-
-  switches = SWITCH_POS.map((p,i) => ({ x:p.x, y:p.y, w:50, h:50, color:SWITCH_COLORS[i], cd:0 }));
+  // Every switch looks identical — what each one does is rolled fresh on every hit.
+  switches = SWITCH_POS.map((p) => ({ x:p.x, y:p.y, w:50, h:50, cd:0 }));
 
   players = [
     mkPlayer(120,        120,         '#4499ff', 'FORD'),
@@ -546,7 +540,9 @@ function checkSwitches() {
       const p = players[i];
       if (p.dead) continue;
       if (rectsOverlap(p.x-p.r, p.y-p.r, p.r*2, p.r*2, sw.x, sw.y, sw.w, sw.h)) {
-        triggerEffect(switchEffectMap[sw.color], i);
+        // Roll a fresh random effect every single time a switch is hit
+        const effect = EFFECTS[Math.floor(Math.random() * EFFECTS.length)];
+        triggerEffect(effect, i);
         sw.cd = SWITCH_CD;
         shake = Math.max(shake, 6);
         break;
@@ -672,10 +668,9 @@ function hostSend() {
   conn.send({
     type:'state',
     ps:  players.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,hp:p.hp,hitFl:p.hitFl,facing:p.facing,dead:p.dead,atkCd:p.atkCd})),
-    sw:  switches.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,color:s.color,cd:s.cd})),
+    sw:  switches.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,cd:s.cd})),
     tr:  traps.map(t=>({type:t.type,x:t.x,y:t.y,w:t.w,h:t.h,vx:t.vx||0,vy:t.vy||0,ttl:t.ttl,warn:t.warn||0})),
     pj:  projectiles.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,ttl:p.ttl,color:p.color,owner:p.owner})),
-    map: switchEffectMap,
     sc:  roundScores,
     re:  roundEndFrame,
     f:   frame,
@@ -688,10 +683,9 @@ function guestSend() {
 }
 function applyState(d) {
   if (Array.isArray(d.ps)) d.ps.forEach((s,i)=>{ if(players[i]) Object.assign(players[i],s); });
-  if (Array.isArray(d.sw)) switches = d.sw.map(s=>({x:+s.x,y:+s.y,w:+s.w,h:+s.h,color:s.color,cd:+s.cd}));
+  if (Array.isArray(d.sw)) switches = d.sw.map(s=>({x:+s.x,y:+s.y,w:+s.w,h:+s.h,cd:+s.cd}));
   if (Array.isArray(d.tr)) traps = d.tr.map(t=>({type:t.type,x:+t.x,y:+t.y,w:+t.w,h:+t.h,vx:+t.vx||0,vy:+t.vy||0,ttl:+t.ttl,warn:+t.warn||0,hits:new Set()}));
   if (Array.isArray(d.pj)) projectiles = d.pj.map(p=>({x:+p.x,y:+p.y,vx:+p.vx,vy:+p.vy,ttl:+p.ttl,color:p.color,owner:p.owner}));
-  if (d.map) switchEffectMap = d.map;
   if (Array.isArray(d.sc)) roundScores = [+d.sc[0]||0, +d.sc[1]||0];
   if (typeof d.re === 'number') roundEndFrame = d.re;
   if (typeof d.f  === 'number') frame = d.f;
@@ -736,16 +730,20 @@ function drawPillars() {
 function drawSwitch(sw) {
   const ready = sw.cd === 0;
   ctx.save();
-  if (ready) { ctx.shadowColor = sw.color; ctx.shadowBlur = 16; }
-  ctx.fillStyle = ready ? sw.color : '#2a2030';
+  if (ready) { ctx.shadowColor = MYSTERY_COLOR; ctx.shadowBlur = 16; }
+  ctx.fillStyle = ready ? '#3a1a55' : '#1f1029';
   ctx.fillRect(sw.x, sw.y, sw.w, sw.h);
   ctx.restore();
-  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(sw.x, sw.y, sw.w, sw.h);
-  if (ready) {
-    const pulse = 4 + Math.sin(frame*0.15)*2;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(sw.x+sw.w/2, sw.y+sw.h/2, pulse, 0, Math.PI*2); ctx.fill();
-  }
+  ctx.strokeStyle = ready ? MYSTERY_COLOR : '#444';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(sw.x, sw.y, sw.w, sw.h);
+  // Mystery "?" — every switch looks the same on purpose
+  ctx.fillStyle = ready ? '#fff' : '#555';
+  ctx.font = `bold ${ready ? 32 + Math.sin(frame*0.18)*2 : 28}px system-ui`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('?', sw.x+sw.w/2, sw.y+sw.h/2 + 2);
+  ctx.textBaseline = 'alphabetic';
 }
 
 function drawTrap(t) {
