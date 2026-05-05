@@ -1,25 +1,22 @@
 # Trap Dungeon
 
-Two-player stick-fighter where the arena is a puzzle. Hit switches to trigger random traps — boulders, spikes, walls — and try not to be the one they hit.
+Top-down two-player dungeon. Walk over colored switches to trigger random traps — spikes, swinging blades, sliding walls, dart volleys — and lure your opponent into them. Players cannot damage each other directly; the room is the weapon.
 
 **Players:** Ford (blue) vs Finn (red), one player per iPad over PeerJS.
-**Platform:** iPad in landscape or portrait, touch only. Desktop keyboard fallback for testing.
+**Platform:** iPad portrait, touch only. Desktop keyboard fallback for testing.
 **Deployed:** https://theroller.github.io/trap-dungeon
 
 ## How to Play
 
-- Walk over a switch to trigger a trap. You don't know what each switch does until you hit it.
-- Some traps hurt the other player. Some hurt YOU. Some hurt both.
-- Bump into your opponent from above to deal damage (jump on their head).
-- Last one alive wins the round.
+- Walk over a colored switch to trigger a trap. Each color does something different — and the colors are randomised every round.
+- Traps hurt whoever they touch, including you. Push your opponent into the spikes!
+- Some switches help you (heal). Some hurt both (shock). The trick is learning what each color does before your opponent does.
+- Last one alive wins.
 
 ## Controls
 
-- Tap left/right of your character — move
-- Tap bottom 28% of screen — jump (double jump available)
-- Walk into a switch — trigger
-- Walk into the other player from above — damage them
-- Spacebar (desktop) — jump
+- **Touch:** drag anywhere on screen — virtual joystick (the further you drag from the start point, the faster you move)
+- **Desktop:** WASD or arrow keys
 
 ## Running Locally
 

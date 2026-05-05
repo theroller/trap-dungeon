@@ -31,9 +31,34 @@ Running history of each weekend session: what was built, what Ford said, what to
 **What to build next:**
 - [ ] Best-of-3 round system (so memorising switch effects across rounds matters)
 - [ ] Visual indicator on switches AFTER triggered, hinting what they did last time
-- [ ] More trap variety: floor drop, control reverse, freeze, fireball spray
+- [ ] More trap variety: floor drop, ice patches, fireball spray
 - [ ] Sound effects — each trap needs its own
 - [ ] Shared multiplayer fix-up pass with lava-rise
+
+---
+
+## Session 2 — 2026-05-04 (same day)
+
+**Version shipped:** v2.0 — full top-down redesign
+
+**What we built:**
+- Pivoted from vertical platformer to top-down dungeon based on Ford's idea
+- Top-down arena, single screen, fixed 800x1200 logical canvas
+- 5 interior pillars to navigate around
+- 6 colored switches placed throughout the room
+- Drag-anywhere virtual joystick (touch); WASD / arrows on desktop
+- AABB collision against walls and pillars
+- Trap-only damage model: players cannot damage each other directly — only traps hurt
+- Spike patches drop under the OTHER player's position when triggered
+- Swinging blade sweeps across the room
+- Sliding wall closes in from one side
+- Dart volleys fire from a random wall
+- Shock damages both, heal restores hitter
+
+**Open questions for Ford:**
+- Should players be able to push each other into traps (bumper-style), or is "lure them in" enough?
+- Does he want a way to block / dodge actively (roll, dash)?
+- Best-of-N rounds, or single-life?
 
 ---
 
