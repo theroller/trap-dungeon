@@ -147,6 +147,10 @@ const kbd2      = { l:false, r:false, u:false, d:false, atk:false };
 const activeTouches = new Map(); // id → { side:'L'|'R', ox,oy, hx,hy }
 let mouseDownPt = null;          // desktop drag joystick (always 'L')
 
+// Guest-side local charge tracking — used to send a discrete 'shoot' event on
+// release so the host can't miss the shot due to the input-send throttle race.
+let localCharge = 0, localAimX = 1, localAimY = 0;
+
 // ── DOM ────────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 const cv = $('c'), ctx = cv.getContext('2d');
@@ -214,6 +218,18 @@ function startHost() {
         remoteInp.dx=+d.dx||0; remoteInp.dy=+d.dy||0;
         remoteInp.ax=+d.ax||0; remoteInp.ay=+d.ay||0;
         remoteInp.aiming=!!d.aiming;
+      }
+      if (d && d.type==='shoot') {
+        // Discrete fire from guest — fires unconditionally regardless of the
+        // throttled input stream, so brief taps can't get lost in the race.
+        const finn = players[1];
+        if (finn && !finn.dead && finn.atkCd === 0) {
+          finn.aimX = +d.ax || 1;
+          finn.aimY = +d.ay || 0;
+          fireShot(finn, Math.min(+d.charge || 0, CHARGE_MAX));
+          finn.aimFrames = 0;
+          finn.atkCd = ATK_CD;
+        }
       }
       if (d && d.type==='restart' && gstate==='matchOver') resetMatch();
     });
@@ -1101,9 +1117,19 @@ function loop() {
     syncTick++;
     if (syncTick%2===0) hostSend();
   } else {
-    // Guest: just send input, render received state
+    // Guest: send input, render received state
     frame++;
     applyInput();
+    // Track local charge so we can fire a discrete shoot event on release
+    if (myInp.aiming) {
+      localCharge++;
+      if (myInp.ax || myInp.ay) { localAimX = myInp.ax; localAimY = myInp.ay; }
+    } else if (localCharge > 0) {
+      if (conn && conn.open) {
+        conn.send({ type:'shoot', charge: localCharge, ax: localAimX, ay: localAimY });
+      }
+      localCharge = 0;
+    }
     syncTick++;
     if (syncTick%2===0) guestSend();
   }
