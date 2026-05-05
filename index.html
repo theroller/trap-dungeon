@@ -77,19 +77,28 @@ canvas { display:block; flex:1; min-height:0; width:100vw; height:100dvh; touch-
 
 <script>
 // ── Constants ──────────────────────────────────────────────────────────────
-const SPEED      = 3.6;
-const HIT_FL     = 14;
-const SWITCH_CD  = 90;
-const PEER_PFX   = 'trapdun-2026-';
-const LOGICAL_W  = 800;
-const LOGICAL_H  = 1200;
-const WALL_TH    = 28;            // outer wall thickness
-const JOY_RADIUS = 70;            // virtual joystick max radius
+const SPEED        = 3.6;
+const HIT_FL       = 14;
+const SWITCH_CD    = 90;
+const PEER_PFX     = 'trapdun-2026-';
+const LOGICAL_W    = 800;
+const LOGICAL_H    = 1200;
+const WALL_TH      = 28;
+const JOY_RADIUS   = 80;
 
-// Room rect (inside the walls)
+// Combat
+const ATK_CD       = 22;     // frames between shots
+const PROJ_SPEED   = 12;
+const PROJ_R       = 7;
+const PROJ_TTL     = 80;
+const BUMPER_PUSH  = 5;      // velocity added to each player on collision
+
+// Match
+const ROUNDS_TO_WIN = 3;     // best of 5
+const ROUND_END_FR  = 150;   // frames between round end and next round
+
 const ROOM = { x: WALL_TH, y: WALL_TH, w: LOGICAL_W - 2*WALL_TH, h: LOGICAL_H - 2*WALL_TH };
 
-// Pillars / interior obstacles (axis-aligned rects)
 const PILLARS = [
   { x: 200, y: 320,  w: 100, h: 100 },
   { x: 500, y: 320,  w: 100, h: 100 },
@@ -98,14 +107,13 @@ const PILLARS = [
   { x: 350, y: 560,  w: 100, h: 80  },
 ];
 
-// Switch positions — placed near pillars and corners so reaching them takes thought
 const SWITCH_POS = [
-  { x: 80,  y: 100 },                    // top-left
-  { x: 660, y: 100 },                    // top-right
-  { x: 370, y: 240 },                    // upper middle
-  { x: 80,  y: 1040 },                   // bottom-left
-  { x: 660, y: 1040 },                   // bottom-right
-  { x: 370, y: 920 },                    // lower middle
+  { x: 80,  y: 100 },
+  { x: 660, y: 100 },
+  { x: 370, y: 240 },
+  { x: 80,  y: 1040 },
+  { x: 660, y: 1040 },
+  { x: 370, y: 920 },
 ];
 
 const EFFECTS = ['spikes', 'blade', 'wallClose', 'darts', 'shock', 'heal'];
@@ -115,23 +123,23 @@ const SWITCH_COLORS = ['#ff4488', '#44ddff', '#ffdd44', '#88ff44', '#ff8844', '#
 let myRole = null, myIdx = 0, peer = null, conn = null;
 
 // ── Game state ─────────────────────────────────────────────────────────────
-let gstate = 'lobby';
-let frame = 0, shake = 0, winner = null;
-let players = [], switches = [], traps = [];
+let gstate = 'lobby';    // lobby | playing | roundOver | matchOver
+let frame = 0, shake = 0, winner = null, roundEndFrame = 0;
+let players = [], switches = [], traps = [], projectiles = [];
 let switchEffectMap = {};
+let roundScores = [0, 0];
 
 // ── Input ──────────────────────────────────────────────────────────────────
-const myInp     = { dx:0, dy:0 };
-const remoteInp = { dx:0, dy:0 };
-const localP2   = { dx:0, dy:0 };
-const kbd1      = { l:false, r:false, u:false, d:false }; // my player
-const kbd2      = { l:false, r:false, u:false, d:false }; // local-mode P2
+// dx,dy = movement vector; ax,ay = aim direction (unit-ish); fire = true if attacking
+const myInp     = { dx:0, dy:0, ax:0, ay:0, fire:false };
+const remoteInp = { dx:0, dy:0, ax:0, ay:0, fire:false };
+const localP2   = { dx:0, dy:0, ax:0, ay:0, fire:false };
+const kbd1      = { l:false, r:false, u:false, d:false, atk:false };
+const kbd2      = { l:false, r:false, u:false, d:false, atk:false };
 
-// Joystick state (one finger per player on its own device)
-let joyTouchId = null;
-let joyOrigin = null;     // { x, y } in canvas coords
-let joyHead   = null;     // current finger position
-let mouseDownPt = null;   // for desktop mouse-drag joystick
+// Multi-touch joysticks: left half = move, right half = attack
+const activeTouches = new Map(); // id → { side:'L'|'R', ox,oy, hx,hy }
+let mouseDownPt = null;          // desktop drag joystick (always 'L')
 
 // ── DOM ────────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -143,15 +151,14 @@ function show(id) {
   if (id === 'game') cv.classList.remove('hidden');
   else $(id).classList.remove('hidden');
 }
-
 function resize() { cv.width = LOGICAL_W; cv.height = LOGICAL_H; }
 function clientToCanvas(clientX, clientY) {
   const r = cv.getBoundingClientRect();
   return { x: (clientX-r.left)*cv.width/r.width, y: (clientY-r.top)*cv.height/r.height };
 }
-window.addEventListener('resize', () => { resize(); if (gstate !== 'playing') setupLevel(); });
+window.addEventListener('resize', () => { resize(); if (gstate === 'lobby') return; if (gstate !== 'playing') setupRound(true); });
 
-// ── Lobby buttons ──────────────────────────────────────────────────────────
+// ── Lobby ──────────────────────────────────────────────────────────────────
 function tap(id, fn) {
   const el = $(id);
   el.addEventListener('touchstart', e => { e.preventDefault(); fn(); }, { passive:false });
@@ -163,7 +170,6 @@ tap('btn-local',     startLocal);
 tap('btn-host-back', () => { destroyPeer(); show('s-lobby'); });
 tap('btn-join-back', () => { destroyPeer(); show('s-lobby'); });
 
-// ── Numpad ─────────────────────────────────────────────────────────────────
 let npd = [];
 function npRefresh() { for(let i=0;i<4;i++) $(`nd${i}`).textContent=npd[i]??'_'; }
 document.querySelectorAll('.np-btn').forEach(b => {
@@ -198,8 +204,12 @@ function startHost() {
     const start = () => { launchGame(); hostSend(); };
     if (conn.open) start(); else conn.on('open', start);
     conn.on('data', d => {
-      if (d && d.type==='input')   { remoteInp.dx=+d.dx||0; remoteInp.dy=+d.dy||0; }
-      if (d && d.type==='restart' && gstate==='gameover') resetGame();
+      if (d && d.type==='input') {
+        remoteInp.dx=+d.dx||0; remoteInp.dy=+d.dy||0;
+        remoteInp.ax=+d.ax||0; remoteInp.ay=+d.ay||0;
+        remoteInp.fire=!!d.fire;
+      }
+      if (d && d.type==='restart' && gstate==='matchOver') resetMatch();
     });
     conn.on('close', () => { if(gstate!=='lobby') returnToLobby(); });
   });
@@ -220,20 +230,22 @@ function startGuest(code) {
 }
 
 function startLocal()    { myRole='local'; myIdx=0; launchGame(); }
-function launchGame()    { show('game'); resize(); setupLevel(); gstate='playing'; }
-function resetGame()     { setupLevel(); gstate='playing'; }
+function launchGame()    { show('game'); resize(); resetMatch(); gstate='playing'; }
 function returnToLobby() { gstate='lobby'; destroyPeer(); show('s-lobby'); }
 
-// ── Level setup ────────────────────────────────────────────────────────────
-function mkPlayer(x, y, color, name) {
-  return { x, y, r:18, vx:0, vy:0, color, name, hp:3, hitFl:0, dead:false, facing:0 };
+// ── Match / round flow ─────────────────────────────────────────────────────
+function resetMatch() {
+  roundScores = [0, 0];
+  setupRound(false);
 }
 
-function setupLevel() {
+function setupRound(keepScores) {
+  if (!keepScores) { /* roundScores already preserved by resetMatch toggling */ }
   frame=0; shake=0; winner=null;
   traps = [];
+  projectiles = [];
 
-  // Random switch → effect map
+  // Random switch → effect map every round (the "memorise" mechanic)
   const eff = [...EFFECTS];
   for (let i=eff.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [eff[i],eff[j]]=[eff[j],eff[i]]; }
   switchEffectMap = {};
@@ -245,47 +257,61 @@ function setupLevel() {
     mkPlayer(120,        120,         '#4499ff', 'FORD'),
     mkPlayer(LOGICAL_W-120, LOGICAL_H-120, '#ff4444', 'FINN'),
   ];
+  gstate = 'playing';
 }
 
-// ── Touch / mouse joystick ─────────────────────────────────────────────────
+function mkPlayer(x, y, color, name) {
+  return { x, y, r:20, vx:0, vy:0, color, name, hp:3, hitFl:0, dead:false, facing:0, atkCd:0 };
+}
+
+function endRound(winnerName) {
+  if (winnerName === 'FORD') roundScores[0]++;
+  else if (winnerName === 'FINN') roundScores[1]++;
+  winner = winnerName;
+  if (roundScores[0] >= ROUNDS_TO_WIN || roundScores[1] >= ROUNDS_TO_WIN) {
+    gstate = 'matchOver';
+  } else {
+    gstate = 'roundOver';
+    roundEndFrame = frame;
+  }
+}
+
+// ── Input: touch (multi-touch with L/R sides) + mouse + keyboard ──────────
 cv.addEventListener('touchstart', e => {
   e.preventDefault();
-  if (gstate==='gameover') {
+  if (gstate==='matchOver') {
     handleReplayTap(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
     return;
   }
-  if (joyTouchId === null) {
-    const t = e.changedTouches[0];
-    joyTouchId = t.identifier;
+  for (const t of e.changedTouches) {
     const p = clientToCanvas(t.clientX, t.clientY);
-    joyOrigin = { x:p.x, y:p.y };
-    joyHead   = { x:p.x, y:p.y };
+    const side = p.x < cv.width/2 ? 'L' : 'R';
+    // Only one touch per side
+    if (![...activeTouches.values()].some(v => v.side === side)) {
+      activeTouches.set(t.identifier, { side, ox:p.x, oy:p.y, hx:p.x, hy:p.y });
+    }
   }
 }, { passive:false });
 
 cv.addEventListener('touchmove', e => {
   e.preventDefault();
   for (const t of e.changedTouches) {
-    if (t.identifier === joyTouchId) {
-      const p = clientToCanvas(t.clientX, t.clientY);
-      joyHead = { x:p.x, y:p.y };
-    }
+    const rec = activeTouches.get(t.identifier);
+    if (rec) { const p = clientToCanvas(t.clientX, t.clientY); rec.hx=p.x; rec.hy=p.y; }
   }
 }, { passive:false });
 
 cv.addEventListener('touchend', e => {
   e.preventDefault();
-  for (const t of e.changedTouches) {
-    if (t.identifier === joyTouchId) { joyTouchId=null; joyOrigin=null; joyHead=null; }
-  }
+  for (const t of e.changedTouches) activeTouches.delete(t.identifier);
 }, { passive:false });
 
 cv.addEventListener('touchcancel', e => {
-  for (const t of e.changedTouches) if (t.identifier === joyTouchId) { joyTouchId=null; joyOrigin=null; joyHead=null; }
+  for (const t of e.changedTouches) activeTouches.delete(t.identifier);
 });
 
 cv.addEventListener('mousedown', e => {
-  if (gstate==='gameover') { handleReplayTap(e.clientX, e.clientY); return; }
+  if (gstate==='matchOver') { handleReplayTap(e.clientX, e.clientY); return; }
   const p = clientToCanvas(e.clientX, e.clientY);
   mouseDownPt = { ox:p.x, oy:p.y, hx:p.x, hy:p.y };
 });
@@ -297,21 +323,22 @@ cv.addEventListener('mouseleave', () => { mouseDownPt = null; });
 
 function handleReplayTap(clientX, clientY) {
   const c = clientToCanvas(clientX, clientY);
-  const bw=220,bh=62,bx=cv.width/2-110,by=cv.height*0.60;
+  const bw=240,bh=64,bx=cv.width/2-120,by=cv.height*0.65;
   if (c.x>=bx&&c.x<=bx+bw&&c.y>=by&&c.y<=by+bh) {
     if (myRole==='guest') { if(conn&&conn.open) conn.send({type:'restart'}); }
-    else resetGame();
+    else resetMatch();
   }
 }
 
-// ── Keyboard ──────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
   if (e.key==='a') kbd1.l=true; if (e.key==='d') kbd1.r=true;
   if (e.key==='w') kbd1.u=true; if (e.key==='s') kbd1.d=true;
+  if (e.key==='f' || e.key===' ') kbd1.atk=true;
   if (myRole==='local') {
     if (e.key==='ArrowLeft')  kbd2.l=true; if (e.key==='ArrowRight') kbd2.r=true;
     if (e.key==='ArrowUp')    kbd2.u=true; if (e.key==='ArrowDown')  kbd2.d=true;
+    if (e.key==='Enter')      kbd2.atk=true;
   } else {
     if (e.key==='ArrowLeft')  kbd1.l=true; if (e.key==='ArrowRight') kbd1.r=true;
     if (e.key==='ArrowUp')    kbd1.u=true; if (e.key==='ArrowDown')  kbd1.d=true;
@@ -320,19 +347,21 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => {
   if (e.key==='a') kbd1.l=false; if (e.key==='d') kbd1.r=false;
   if (e.key==='w') kbd1.u=false; if (e.key==='s') kbd1.d=false;
+  if (e.key==='f' || e.key===' ') kbd1.atk=false;
   if (e.key==='ArrowLeft')  { kbd1.l=false; kbd2.l=false; }
   if (e.key==='ArrowRight') { kbd1.r=false; kbd2.r=false; }
   if (e.key==='ArrowUp')    { kbd1.u=false; kbd2.u=false; }
   if (e.key==='ArrowDown')  { kbd1.d=false; kbd2.d=false; }
+  if (e.key==='Enter')        kbd2.atk=false;
 });
 
-function joystickVec(origin, head) {
-  if (!origin || !head) return { dx:0, dy:0 };
-  let dx = head.x - origin.x, dy = head.y - origin.y;
+function joyVec(rec) {
+  if (!rec) return { dx:0, dy:0, mag:0 };
+  let dx = rec.hx - rec.ox, dy = rec.hy - rec.oy;
   const m = Math.hypot(dx, dy);
-  if (m < 12) return { dx:0, dy:0 }; // deadzone
+  if (m < 14) return { dx:0, dy:0, mag:0 };       // deadzone
   const cap = Math.min(m, JOY_RADIUS);
-  return { dx: dx/m * (cap/JOY_RADIUS), dy: dy/m * (cap/JOY_RADIUS) };
+  return { dx: dx/m * (cap/JOY_RADIUS), dy: dy/m * (cap/JOY_RADIUS), mag: m };
 }
 function kbdVec(k) {
   let dx = (k.r?1:0) - (k.l?1:0);
@@ -343,38 +372,75 @@ function kbdVec(k) {
 }
 
 function applyInput() {
-  // Keyboard always contributes (so desktop testing works in any role)
-  const k = kbdVec(kbd1);
-  let dx = k.dx, dy = k.dy;
+  // Default everything
+  myInp.dx=0; myInp.dy=0; myInp.ax=0; myInp.ay=0; myInp.fire=false;
+
+  // Keyboard contribution (always available for testing)
+  const kv = kbdVec(kbd1);
+  myInp.dx = kv.dx; myInp.dy = kv.dy;
+  if (kbd1.atk) {
+    // Aim in current movement direction; if not moving, aim up
+    let ax = kv.dx, ay = kv.dy;
+    if (!ax && !ay) {
+      const me = players[myIdx];
+      ax = me ? Math.cos(me.facing) : 1;
+      ay = me ? Math.sin(me.facing) : 0;
+    }
+    myInp.ax = ax; myInp.ay = ay; myInp.fire = true;
+  }
+
   if (myRole !== 'local') {
-    const j = joystickVec(joyOrigin, joyHead);
-    if (j.dx || j.dy) { dx = j.dx; dy = j.dy; }
-    if (mouseDownPt && !dx && !dy) {
-      const m = joystickVec({x:mouseDownPt.ox,y:mouseDownPt.oy},{x:mouseDownPt.hx,y:mouseDownPt.hy});
-      dx = m.dx; dy = m.dy;
+    // Touch joysticks: L = movement, R = aim+fire
+    let leftRec = null, rightRec = null;
+    for (const [, rec] of activeTouches) {
+      if (rec.side === 'L') leftRec = rec;
+      else                  rightRec = rec;
+    }
+    // Mouse drag (desktop) acts as left joystick if present
+    if (!leftRec && mouseDownPt) leftRec = mouseDownPt;
+
+    if (leftRec) { const v = joyVec(leftRec); if (v.mag) { myInp.dx = v.dx; myInp.dy = v.dy; } }
+    if (rightRec) {
+      const v = joyVec(rightRec);
+      // Holding right joystick = firing. Aim: drag direction, or facing if barely moved.
+      myInp.fire = true;
+      if (v.mag) { myInp.ax = v.dx; myInp.ay = v.dy; }
+      else {
+        const me = players[myIdx];
+        myInp.ax = me ? Math.cos(me.facing) : 1;
+        myInp.ay = me ? Math.sin(me.facing) : 0;
+      }
     }
   }
-  myInp.dx = dx; myInp.dy = dy;
+
   if (myRole === 'local') {
-    const k2 = kbdVec(kbd2); localP2.dx = k2.dx; localP2.dy = k2.dy;
+    const k2 = kbdVec(kbd2);
+    localP2.dx = k2.dx; localP2.dy = k2.dy;
+    localP2.fire = !!kbd2.atk;
+    if (kbd2.atk) {
+      let ax = k2.dx, ay = k2.dy;
+      if (!ax && !ay) {
+        const p = players[1];
+        ax = p ? Math.cos(p.facing) : -1;
+        ay = p ? Math.sin(p.facing) : 0;
+      }
+      localP2.ax = ax; localP2.ay = ay;
+    } else { localP2.ax=0; localP2.ay=0; }
   }
 }
 
-// ── Physics (top-down AABB) ────────────────────────────────────────────────
+// ── Physics ────────────────────────────────────────────────────────────────
 function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
   return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
 }
 
 function collideMove(p, dx, dy) {
-  // Move in X then Y, resolving against walls and pillars
   const tryAxis = (axis, delta) => {
     if (axis==='x') p.x += delta; else p.y += delta;
-    // Outer walls
     if (p.x - p.r < ROOM.x) p.x = ROOM.x + p.r;
     if (p.x + p.r > ROOM.x + ROOM.w) p.x = ROOM.x + ROOM.w - p.r;
     if (p.y - p.r < ROOM.y) p.y = ROOM.y + p.r;
     if (p.y + p.r > ROOM.y + ROOM.h) p.y = ROOM.y + ROOM.h - p.r;
-    // Pillars
     for (const o of PILLARS) {
       if (p.x + p.r > o.x && p.x - p.r < o.x + o.w &&
           p.y + p.r > o.y && p.y - p.r < o.y + o.h) {
@@ -395,23 +461,90 @@ function collideMove(p, dx, dy) {
 function updatePlayer(p, inp) {
   if (p.dead) return;
   if (p.hitFl > 0) p.hitFl--;
+  if (p.atkCd > 0) p.atkCd--;
   // Knockback decay
-  p.vx *= 0.82; p.vy *= 0.82;
-  if (Math.abs(p.vx)<0.05) p.vx=0; if (Math.abs(p.vy)<0.05) p.vy=0;
+  p.vx *= 0.84; p.vy *= 0.84;
+  if (Math.abs(p.vx) < 0.05) p.vx = 0;
+  if (Math.abs(p.vy) < 0.05) p.vy = 0;
+  // Aim direction takes priority for facing; movement direction otherwise
+  if (Math.hypot(inp.ax, inp.ay) > 0.1) p.facing = Math.atan2(inp.ay, inp.ax);
+  else if (Math.hypot(inp.dx, inp.dy) > 0.1) p.facing = Math.atan2(inp.dy, inp.dx);
   const mvx = inp.dx * SPEED + p.vx;
   const mvy = inp.dy * SPEED + p.vy;
-  if (Math.abs(inp.dx) > 0.1 || Math.abs(inp.dy) > 0.1) p.facing = Math.atan2(inp.dy, inp.dx);
   collideMove(p, mvx, mvy);
+
+  // Fire
+  if (inp.fire && p.atkCd === 0) {
+    const ax = inp.ax || Math.cos(p.facing);
+    const ay = inp.ay || Math.sin(p.facing);
+    const m = Math.hypot(ax, ay) || 1;
+    projectiles.push({
+      x: p.x + (ax/m)*(p.r+6),
+      y: p.y + (ay/m)*(p.r+6),
+      vx: (ax/m) * PROJ_SPEED,
+      vy: (ay/m) * PROJ_SPEED,
+      ttl: PROJ_TTL,
+      owner: p.name,
+      color: p.color,
+    });
+    p.atkCd = ATK_CD;
+  }
+}
+
+// Bumper push — players knock each other on contact, no damage
+function bumperPush() {
+  const [a, b] = players;
+  if (a.dead || b.dead) return;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy) || 0.001;
+  const minD = a.r + b.r;
+  if (dist >= minD) return;
+  const nx = dx/dist, ny = dy/dist;
+  const overlap = (minD - dist) / 2;
+  // Separate
+  a.x -= nx * overlap; a.y -= ny * overlap;
+  b.x += nx * overlap; b.y += ny * overlap;
+  // Apply push velocity (both directions)
+  a.vx -= nx * BUMPER_PUSH; a.vy -= ny * BUMPER_PUSH;
+  b.vx += nx * BUMPER_PUSH; b.vy += ny * BUMPER_PUSH;
+  shake = Math.max(shake, 5);
+}
+
+function updateProjectiles() {
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const pr = projectiles[i];
+    pr.x += pr.vx; pr.y += pr.vy; pr.ttl--;
+    // Out of room?
+    if (pr.x < ROOM.x || pr.x > ROOM.x+ROOM.w || pr.y < ROOM.y || pr.y > ROOM.y+ROOM.h) { projectiles.splice(i,1); continue; }
+    // Pillar?
+    let hitPillar = false;
+    for (const o of PILLARS) {
+      if (pr.x > o.x && pr.x < o.x+o.w && pr.y > o.y && pr.y < o.y+o.h) { hitPillar = true; break; }
+    }
+    if (hitPillar) { projectiles.splice(i,1); continue; }
+    // Player?
+    let hitPlayer = false;
+    for (const p of players) {
+      if (p.dead || p.name === pr.owner) continue;
+      const d = Math.hypot(p.x - pr.x, p.y - pr.y);
+      if (d < p.r + PROJ_R) {
+        damagePlayer(p, pr.vx, pr.vy, 5);
+        hitPlayer = true;
+        break;
+      }
+    }
+    if (hitPlayer) { projectiles.splice(i,1); continue; }
+    if (pr.ttl <= 0) projectiles.splice(i,1);
+  }
 }
 
 // ── Switches & traps ──────────────────────────────────────────────────────
 function checkSwitches() {
   for (const sw of switches) {
     if (sw.cd > 0) { sw.cd--; continue; }
-    for (let i=0;i<players.length;i++) {
+    for (let i = 0; i < players.length; i++) {
       const p = players[i];
       if (p.dead) continue;
-      // Circle vs rect overlap (approx via AABB of player)
       if (rectsOverlap(p.x-p.r, p.y-p.r, p.r*2, p.r*2, sw.x, sw.y, sw.w, sw.h)) {
         triggerEffect(switchEffectMap[sw.color], i);
         sw.cd = SWITCH_CD;
@@ -426,26 +559,21 @@ function triggerEffect(effect, hitterIdx) {
   const hitter = players[hitterIdx];
   const other  = players[1 - hitterIdx];
   switch (effect) {
-    case 'spikes': {
-      // Spike patch under the OTHER player's current position
+    case 'spikes':
       traps.push({ type:'spikes', x: other.x - 70, y: other.y - 70, w:140, h:140, ttl:180, hits:new Set(), warn:30 });
       break;
-    }
     case 'blade': {
-      // Horizontal blade sweeps from one side to the other across the room middle
       const fromLeft = Math.random() < 0.5;
       traps.push({
         type:'blade',
         x: fromLeft ? ROOM.x : ROOM.x + ROOM.w - 80,
-        y: ROOM.y + ROOM.h/2 - 40,
-        w: 80, h: 80,
+        y: ROOM.y + ROOM.h/2 - 40, w: 80, h: 80,
         vx: fromLeft ? 7 : -7, vy: 0,
         ttl: 200, hits: new Set()
       });
       break;
     }
     case 'wallClose': {
-      // A vertical wall slides from a random side, knocking players away
       const fromLeft = Math.random() < 0.5;
       traps.push({
         type:'wall',
@@ -457,38 +585,34 @@ function triggerEffect(effect, hitterIdx) {
       break;
     }
     case 'darts': {
-      // 5 darts shoot from one wall in a volley
-      const side = Math.floor(Math.random()*4); // 0=top 1=right 2=bottom 3=left
+      const side = Math.floor(Math.random()*4);
       for (let i=0;i<5;i++){
         let x,y,vx,vy;
-        const spread = ROOM.w/6 * (i+0.5) + ROOM.x;
-        const vSpread = ROOM.h/6 * (i+0.5) + ROOM.y;
-        if (side===0) { x=spread; y=ROOM.y; vx=0; vy=10; }
-        if (side===1) { x=ROOM.x+ROOM.w; y=vSpread; vx=-10; vy=0; }
-        if (side===2) { x=spread; y=ROOM.y+ROOM.h; vx=0; vy=-10; }
-        if (side===3) { x=ROOM.x; y=vSpread; vx=10; vy=0; }
+        const sH = ROOM.w/6 * (i+0.5) + ROOM.x;
+        const sV = ROOM.h/6 * (i+0.5) + ROOM.y;
+        if (side===0) { x=sH; y=ROOM.y; vx=0; vy=10; }
+        if (side===1) { x=ROOM.x+ROOM.w; y=sV; vx=-10; vy=0; }
+        if (side===2) { x=sH; y=ROOM.y+ROOM.h; vx=0; vy=-10; }
+        if (side===3) { x=ROOM.x; y=sV; vx=10; vy=0; }
         traps.push({ type:'dart', x, y, w:14, h:14, vx, vy, ttl: 200, hits:new Set() });
       }
       break;
     }
-    case 'shock': {
+    case 'shock':
       players.forEach(p => { if(!p.dead){ p.hp--; p.hitFl=HIT_FL; }});
       shake = 16;
       break;
-    }
-    case 'heal': {
+    case 'heal':
       hitter.hp = Math.min(3, hitter.hp+1);
       traps.push({ type:'sparkle', x:hitter.x, y:hitter.y, w:0, h:0, vx:0, vy:0, ttl:40 });
       break;
-    }
   }
 }
 
 function damagePlayer(p, kx, ky, force) {
   p.hp--; p.hitFl = HIT_FL;
   const m = Math.hypot(kx, ky) || 1;
-  p.vx = (kx/m) * force;
-  p.vy = (ky/m) * force;
+  p.vx = (kx/m) * force; p.vy = (ky/m) * force;
   shake = Math.max(shake, 8);
 }
 
@@ -521,7 +645,6 @@ function updateTraps() {
         if (p.dead) return;
         if (rectsOverlap(p.x-p.r, p.y-p.r, p.r*2, p.r*2, t.x, t.y, t.w, t.h)) {
           damagePlayer(p, t.vx, 0, 14);
-          // Push player out so wall doesn't repeatedly hit
           if (t.vx > 0) p.x = t.x + t.w + p.r + 1;
           else          p.x = t.x - p.r - 1;
         }
@@ -536,7 +659,6 @@ function updateTraps() {
           t.ttl = 0;
         }
       });
-      // Despawn if leaves room
       if (t.x < ROOM.x-30 || t.x > ROOM.x+ROOM.w+30 || t.y < ROOM.y-30 || t.y > ROOM.y+ROOM.h+30) t.ttl = 0;
     }
     if (t.ttl <= 0) traps.splice(i, 1);
@@ -549,22 +671,30 @@ function hostSend() {
   if(!conn||!conn.open) return;
   conn.send({
     type:'state',
-    ps:  players.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,hp:p.hp,hitFl:p.hitFl,facing:p.facing,dead:p.dead})),
+    ps:  players.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,hp:p.hp,hitFl:p.hitFl,facing:p.facing,dead:p.dead,atkCd:p.atkCd})),
     sw:  switches.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,color:s.color,cd:s.cd})),
     tr:  traps.map(t=>({type:t.type,x:t.x,y:t.y,w:t.w,h:t.h,vx:t.vx||0,vy:t.vy||0,ttl:t.ttl,warn:t.warn||0})),
+    pj:  projectiles.map(p=>({x:p.x,y:p.y,vx:p.vx,vy:p.vy,ttl:p.ttl,color:p.color,owner:p.owner})),
     map: switchEffectMap,
+    sc:  roundScores,
+    re:  roundEndFrame,
+    f:   frame,
     gstate, winner,
   });
 }
 function guestSend() {
   if(!conn||!conn.open) return;
-  conn.send({ type:'input', dx:myInp.dx, dy:myInp.dy });
+  conn.send({ type:'input', dx:myInp.dx, dy:myInp.dy, ax:myInp.ax, ay:myInp.ay, fire:myInp.fire });
 }
 function applyState(d) {
   if (Array.isArray(d.ps)) d.ps.forEach((s,i)=>{ if(players[i]) Object.assign(players[i],s); });
   if (Array.isArray(d.sw)) switches = d.sw.map(s=>({x:+s.x,y:+s.y,w:+s.w,h:+s.h,color:s.color,cd:+s.cd}));
   if (Array.isArray(d.tr)) traps = d.tr.map(t=>({type:t.type,x:+t.x,y:+t.y,w:+t.w,h:+t.h,vx:+t.vx||0,vy:+t.vy||0,ttl:+t.ttl,warn:+t.warn||0,hits:new Set()}));
+  if (Array.isArray(d.pj)) projectiles = d.pj.map(p=>({x:+p.x,y:+p.y,vx:+p.vx,vy:+p.vy,ttl:+p.ttl,color:p.color,owner:p.owner}));
   if (d.map) switchEffectMap = d.map;
+  if (Array.isArray(d.sc)) roundScores = [+d.sc[0]||0, +d.sc[1]||0];
+  if (typeof d.re === 'number') roundEndFrame = d.re;
+  if (typeof d.f  === 'number') frame = d.f;
   if (d.gstate) gstate = d.gstate;
   winner = d.winner ?? null;
 }
@@ -576,26 +706,17 @@ function drawBg() {
 }
 
 function drawRoom() {
-  // Floor
   ctx.fillStyle = '#22132c';
   ctx.fillRect(ROOM.x, ROOM.y, ROOM.w, ROOM.h);
-  // Floor tile pattern
-  ctx.strokeStyle = '#2c1838';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#2c1838'; ctx.lineWidth = 1;
   const ts = 80;
-  for (let x = ROOM.x; x <= ROOM.x+ROOM.w; x += ts) {
-    ctx.beginPath(); ctx.moveTo(x, ROOM.y); ctx.lineTo(x, ROOM.y+ROOM.h); ctx.stroke();
-  }
-  for (let y = ROOM.y; y <= ROOM.y+ROOM.h; y += ts) {
-    ctx.beginPath(); ctx.moveTo(ROOM.x, y); ctx.lineTo(ROOM.x+ROOM.w, y); ctx.stroke();
-  }
-  // Outer walls
+  for (let x = ROOM.x; x <= ROOM.x+ROOM.w; x += ts) { ctx.beginPath(); ctx.moveTo(x, ROOM.y); ctx.lineTo(x, ROOM.y+ROOM.h); ctx.stroke(); }
+  for (let y = ROOM.y; y <= ROOM.y+ROOM.h; y += ts) { ctx.beginPath(); ctx.moveTo(ROOM.x, y); ctx.lineTo(ROOM.x+ROOM.w, y); ctx.stroke(); }
   ctx.fillStyle = '#5b3078';
   ctx.fillRect(0, 0, cv.width, WALL_TH);
   ctx.fillRect(0, cv.height-WALL_TH, cv.width, WALL_TH);
   ctx.fillRect(0, 0, WALL_TH, cv.height);
   ctx.fillRect(cv.width-WALL_TH, 0, WALL_TH, cv.height);
-  // Wall highlight
   ctx.fillStyle = '#7a4099';
   ctx.fillRect(0, WALL_TH-3, cv.width, 3);
   ctx.fillRect(0, cv.height-WALL_TH, cv.width, 3);
@@ -605,15 +726,10 @@ function drawRoom() {
 
 function drawPillars() {
   for (const o of PILLARS) {
-    ctx.fillStyle = '#3a2050';
-    ctx.fillRect(o.x, o.y, o.w, o.h);
-    ctx.fillStyle = '#5b3078';
-    ctx.fillRect(o.x, o.y, o.w, 4);
-    ctx.fillStyle = '#1a0c25';
-    ctx.fillRect(o.x, o.y+o.h-4, o.w, 4);
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(o.x, o.y, o.w, o.h);
+    ctx.fillStyle = '#3a2050'; ctx.fillRect(o.x, o.y, o.w, o.h);
+    ctx.fillStyle = '#5b3078'; ctx.fillRect(o.x, o.y, o.w, 4);
+    ctx.fillStyle = '#1a0c25'; ctx.fillRect(o.x, o.y+o.h-4, o.w, 4);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeRect(o.x, o.y, o.w, o.h);
   }
 }
 
@@ -624,10 +740,7 @@ function drawSwitch(sw) {
   ctx.fillStyle = ready ? sw.color : '#2a2030';
   ctx.fillRect(sw.x, sw.y, sw.w, sw.h);
   ctx.restore();
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(sw.x, sw.y, sw.w, sw.h);
-  // Pulsing dot in center when ready
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(sw.x, sw.y, sw.w, sw.h);
   if (ready) {
     const pulse = 4 + Math.sin(frame*0.15)*2;
     ctx.fillStyle = '#fff';
@@ -637,7 +750,6 @@ function drawSwitch(sw) {
 
 function drawTrap(t) {
   if (t.warn !== undefined && t.warn > 0) {
-    // Warning indicator before spikes appear
     if (t.type === 'spikes') {
       ctx.save();
       ctx.globalAlpha = 0.4 + Math.sin(frame*0.5)*0.2;
@@ -649,8 +761,7 @@ function drawTrap(t) {
   }
   if (t.type === 'spikes') {
     ctx.fillStyle = '#dd2244';
-    const cols = Math.floor(t.w / 16);
-    const rows = Math.floor(t.h / 16);
+    const cols = Math.floor(t.w / 16), rows = Math.floor(t.h / 16);
     for (let cx = 0; cx < cols; cx++) for (let cy = 0; cy < rows; cy++) {
       const px = t.x + cx*16 + 2, py = t.y + cy*16 + 2;
       ctx.beginPath();
@@ -675,25 +786,22 @@ function drawTrap(t) {
     ctx.beginPath(); ctx.arc(0,0,8,0,Math.PI*2); ctx.fill();
     ctx.restore();
   } else if (t.type === 'wall') {
-    ctx.fillStyle = '#552288';
-    ctx.fillRect(t.x, t.y, t.w, t.h);
+    ctx.fillStyle = '#552288'; ctx.fillRect(t.x, t.y, t.w, t.h);
     ctx.fillStyle = '#7733aa';
     ctx.fillRect(t.x, t.y, 6, t.h);
     ctx.fillRect(t.x+t.w-6, t.y, 6, t.h);
   } else if (t.type === 'dart') {
+    ctx.save();
     ctx.fillStyle = '#ddd';
-    ctx.beginPath();
-    const ang = Math.atan2(t.vy, t.vx);
     ctx.translate(t.x+t.w/2, t.y+t.h/2);
-    ctx.rotate(ang);
+    ctx.rotate(Math.atan2(t.vy, t.vx));
+    ctx.beginPath();
     ctx.moveTo(10,0); ctx.lineTo(-6,5); ctx.lineTo(-6,-5);
     ctx.closePath(); ctx.fill();
-    ctx.setTransform(1,0,0,1,0,0);
+    ctx.restore();
   } else if (t.type === 'sparkle') {
     const a = t.ttl/40;
-    ctx.save();
-    ctx.globalAlpha = a;
-    ctx.fillStyle = '#88ff44';
+    ctx.save(); ctx.globalAlpha = a; ctx.fillStyle = '#88ff44';
     for (let i=0;i<8;i++){
       const ang = (i/8)*Math.PI*2 + frame*0.05;
       const r = 30*(1-a);
@@ -703,22 +811,51 @@ function drawTrap(t) {
   }
 }
 
+function drawProjectile(pr) {
+  ctx.save();
+  ctx.shadowColor = pr.color; ctx.shadowBlur = 12;
+  ctx.fillStyle = pr.color;
+  ctx.beginPath(); ctx.arc(pr.x, pr.y, PROJ_R, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(pr.x, pr.y, PROJ_R*0.4, 0, Math.PI*2); ctx.fill();
+}
+
+function drawAimLine(p, inp) {
+  if (!inp.fire) return;
+  const ax = inp.ax || Math.cos(p.facing);
+  const ay = inp.ay || Math.sin(p.facing);
+  const m = Math.hypot(ax, ay) || 1;
+  const dx = ax/m, dy = ay/m;
+  ctx.save();
+  ctx.strokeStyle = p.color; ctx.lineWidth = 3;
+  ctx.globalAlpha = 0.4; ctx.setLineDash([6, 8]);
+  ctx.beginPath();
+  ctx.moveTo(p.x + dx*p.r, p.y + dy*p.r);
+  ctx.lineTo(p.x + dx*180, p.y + dy*180);
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawPlayer(p) {
   if (p.dead) return;
   const fl = p.hitFl>0 && (p.hitFl%3<2);
   ctx.save();
-  // Body
   ctx.fillStyle = fl ? '#fff' : p.color;
   ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
   ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
-  // Facing indicator
-  const fx = p.x + Math.cos(p.facing) * (p.r-2);
-  const fy = p.y + Math.sin(p.facing) * (p.r-2);
-  ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.lineCap = 'round';
-  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(fx, fy); ctx.stroke();
+  // Facing indicator: triangle "gun barrel"
+  const fx = p.x + Math.cos(p.facing) * (p.r+2);
+  const fy = p.y + Math.sin(p.facing) * (p.r+2);
+  ctx.fillStyle = '#fff';
+  ctx.save();
+  ctx.translate(fx, fy);
+  ctx.rotate(p.facing);
+  ctx.fillRect(0, -4, 14, 8);
+  ctx.restore();
   ctx.restore();
 
-  // Name + HP above head
+  // Name + HP
   ctx.fillStyle = p.color; ctx.font='bold 14px system-ui'; ctx.textAlign='center';
   const isMe = (myRole==='local') ||
                (myRole==='host' && p.name==='FORD') ||
@@ -731,81 +868,127 @@ function drawPlayer(p) {
   }
 }
 
-function drawJoystick() {
-  let origin = null, head = null;
-  if (joyOrigin && joyHead) { origin = joyOrigin; head = joyHead; }
-  else if (mouseDownPt)     { origin = {x:mouseDownPt.ox,y:mouseDownPt.oy}; head = {x:mouseDownPt.hx,y:mouseDownPt.hy}; }
-  if (!origin) return;
+function drawJoystick(rec, color) {
+  if (!rec) return;
   ctx.save();
-  ctx.globalAlpha = 0.35;
-  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3;
-  ctx.beginPath(); ctx.arc(origin.x, origin.y, JOY_RADIUS, 0, Math.PI*2); ctx.stroke();
-  ctx.fillStyle = '#fff';
-  let hx = head.x - origin.x, hy = head.y - origin.y;
+  ctx.globalAlpha = 0.4;
+  ctx.strokeStyle = color; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(rec.ox, rec.oy, JOY_RADIUS, 0, Math.PI*2); ctx.stroke();
+  ctx.fillStyle = color;
+  let hx = rec.hx - rec.ox, hy = rec.hy - rec.oy;
   const m = Math.hypot(hx, hy);
   if (m > JOY_RADIUS) { hx = hx/m*JOY_RADIUS; hy = hy/m*JOY_RADIUS; }
-  ctx.beginPath(); ctx.arc(origin.x+hx, origin.y+hy, 28, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(rec.ox+hx, rec.oy+hy, 30, 0, Math.PI*2); ctx.fill();
   ctx.restore();
 }
 
-function drawHUD() {
-  ctx.fillStyle = '#a855ff'; ctx.font = 'bold 17px system-ui'; ctx.textAlign = 'center';
-  ctx.fillText('TRAP DUNGEON', cv.width/2, 20);
-  if (myRole !== 'local') {
-    ctx.fillStyle = conn&&conn.open ? '#00ff88' : '#ff4444';
-    ctx.font='12px system-ui'; ctx.textAlign='right';
-    ctx.fillText((conn&&conn.open?'● online':'● offline')+'  sw:'+switches.length+' tr:'+traps.length, cv.width-12, 18);
+function drawJoysticks() {
+  let leftRec = null, rightRec = null;
+  for (const [, rec] of activeTouches) {
+    if (rec.side === 'L') leftRec = rec; else rightRec = rec;
   }
-  // Hint
-  ctx.fillStyle = '#ffffff44'; ctx.font='12px system-ui'; ctx.textAlign='left';
-  ctx.fillText('drag to move • walk into switches', 12, cv.height-12);
+  if (!leftRec && mouseDownPt) leftRec = mouseDownPt;
+  drawJoystick(leftRec,  '#88ddff');
+  drawJoystick(rightRec, '#ffaa44');
 }
 
-function drawGameOver() {
-  ctx.fillStyle = 'rgba(0,0,0,0.62)'; ctx.fillRect(0,0,cv.width,cv.height);
+function drawHUD() {
+  // Score banner at the very top — large round-win pips for both players
+  ctx.fillStyle = '#000a';
+  ctx.fillRect(0, 0, cv.width, 48);
+  // Ford pips left
+  for (let i=0;i<ROUNDS_TO_WIN;i++) {
+    ctx.beginPath(); ctx.arc(28 + i*26, 24, 9, 0, Math.PI*2);
+    ctx.fillStyle = i<roundScores[0] ? '#4499ff' : '#222'; ctx.fill();
+    ctx.strokeStyle='#4499ff'; ctx.lineWidth=2; ctx.stroke();
+  }
+  // Finn pips right
+  for (let i=0;i<ROUNDS_TO_WIN;i++) {
+    const rx = cv.width - 28 - (ROUNDS_TO_WIN-1-i)*26;
+    ctx.beginPath(); ctx.arc(rx, 24, 9, 0, Math.PI*2);
+    ctx.fillStyle = i<roundScores[1] ? '#ff4444' : '#222'; ctx.fill();
+    ctx.strokeStyle='#ff4444'; ctx.lineWidth=2; ctx.stroke();
+  }
+  ctx.fillStyle = '#a855ff'; ctx.font = 'bold 17px system-ui'; ctx.textAlign = 'center';
+  ctx.fillText('TRAP DUNGEON  •  best of '+(ROUNDS_TO_WIN*2-1), cv.width/2, 30);
+
+  if (myRole !== 'local') {
+    ctx.fillStyle = conn&&conn.open ? '#00ff88' : '#ff4444';
+    ctx.font='11px system-ui'; ctx.textAlign='right';
+    ctx.fillText((conn&&conn.open?'● online':'● offline')+'  pj:'+projectiles.length+' tr:'+traps.length, cv.width-12, 64);
+  }
+}
+
+function drawRoundOver() {
+  ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,cv.width,cv.height);
   const col = winner==='FORD' ? '#4499ff' : winner==='FINN' ? '#ff4444' : '#ffaa00';
-  ctx.fillStyle = col; ctx.font = `bold ${Math.floor(cv.width*0.09)}px system-ui`; ctx.textAlign='center';
-  ctx.fillText(winner==='NOBODY' ? 'DRAW!' : winner+' WINS!', cv.width/2, cv.height*0.35);
-  ctx.fillStyle = '#a855ff'; ctx.font = `${Math.floor(cv.width*0.04)}px system-ui`;
-  ctx.fillText('survived the traps!', cv.width/2, cv.height*0.48);
-  const bw=220,bh=62,bx=cv.width/2-110,by=cv.height*0.60;
+  ctx.fillStyle=col; ctx.font=`bold ${Math.floor(cv.width*0.08)}px system-ui`; ctx.textAlign='center';
+  ctx.fillText((winner||'NOBODY')+' takes the round!', cv.width/2, cv.height*0.45);
+  ctx.fillStyle='#fff'; ctx.font=`${Math.floor(cv.width*0.05)}px system-ui`;
+  ctx.fillText(roundScores[0]+' — '+roundScores[1], cv.width/2, cv.height*0.55);
+  const elapsed = frame - roundEndFrame;
+  const remaining = Math.max(0, ROUND_END_FR - elapsed);
+  ctx.fillStyle='#aaa'; ctx.font='20px system-ui';
+  ctx.fillText('next round in '+(Math.ceil(remaining/60))+'…', cv.width/2, cv.height*0.62);
+}
+
+function drawMatchOver() {
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,0,cv.width,cv.height);
+  const champ = roundScores[0] > roundScores[1] ? 'FORD' : roundScores[1] > roundScores[0] ? 'FINN' : null;
+  const col = champ==='FORD' ? '#4499ff' : champ==='FINN' ? '#ff4444' : '#ffaa00';
+  ctx.fillStyle=col; ctx.font=`bold ${Math.floor(cv.width*0.10)}px system-ui`; ctx.textAlign='center';
+  ctx.fillText(champ ? champ+' WINS!' : 'DRAW', cv.width/2, cv.height*0.32);
+  ctx.fillStyle='#fff'; ctx.font=`${Math.floor(cv.width*0.06)}px system-ui`;
+  ctx.fillText('final  '+roundScores[0]+' — '+roundScores[1], cv.width/2, cv.height*0.45);
+  const bw=240,bh=64,bx=cv.width/2-120,by=cv.height*0.65;
   ctx.fillStyle='#333'; ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,12); ctx.fill();
   ctx.fillStyle='#fff'; ctx.font='bold 26px system-ui';
   ctx.fillText('PLAY AGAIN', cv.width/2, by+42);
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────
+let syncTick=0;
 function loop() {
   requestAnimationFrame(loop);
-  if (gstate!=='playing'&&gstate!=='gameover') return;
+  if (gstate==='lobby') return;
 
   let sx=0,sy=0;
   if (shake>0) { sx=(Math.random()-.5)*7; sy=(Math.random()-.5)*7; shake--; }
   ctx.save(); ctx.translate(sx,sy);
 
-  if (gstate==='playing') {
+  if (myRole==='host'||myRole==='local') {
     frame++;
-    if (myRole==='host'||myRole==='local') {
-      applyInput();
+    applyInput();
+    if (gstate === 'playing') {
       const p2inp = myRole==='local' ? localP2 : remoteInp;
       updatePlayer(players[0], myInp);
       updatePlayer(players[1], p2inp);
+      bumperPush();
       checkSwitches();
       updateTraps();
+      updateProjectiles();
 
       players.forEach(p => { if (p.hp<=0) p.dead = true; });
       const alive = players.filter(p => !p.dead);
-      if (alive.length<=1 && !winner) {
-        winner = alive.length ? alive[0].name : 'NOBODY';
-        gstate = 'gameover';
+      if (alive.length<=1) {
+        endRound(alive.length ? alive[0].name : 'NOBODY');
       }
-      syncTick++;
-      if (syncTick%2===0) hostSend();
-    } else {
-      applyInput();
-      syncTick++;
-      if (syncTick%2===0) guestSend();
+    } else if (gstate === 'roundOver') {
+      // Cool down active traps and projectiles until next round
+      updateTraps();
+      updateProjectiles();
+      if (frame - roundEndFrame >= ROUND_END_FR) {
+        setupRound(true); // keeps roundScores
+      }
     }
+    syncTick++;
+    if (syncTick%2===0) hostSend();
+  } else {
+    // Guest: just send input, render received state
+    frame++;
+    applyInput();
+    syncTick++;
+    if (syncTick%2===0) guestSend();
   }
 
   drawBg();
@@ -813,16 +996,21 @@ function loop() {
   switches.forEach(drawSwitch);
   drawPillars();
   traps.forEach(drawTrap);
+  projectiles.forEach(drawProjectile);
+  // Aim line for the local player while firing
+  const me = players[myIdx];
+  if (me && !me.dead) drawAimLine(me, myInp);
   players.forEach(drawPlayer);
-  drawJoystick();
+  drawJoysticks();
   drawHUD();
-  if (gstate==='gameover') drawGameOver();
+  if (gstate === 'roundOver') drawRoundOver();
+  if (gstate === 'matchOver') drawMatchOver();
 
   ctx.restore();
 }
 
 show('s-lobby');
-setupLevel();
+setupRound(false);
 loop();
 </script>
 </body>

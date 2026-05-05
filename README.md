@@ -13,10 +13,16 @@ Top-down two-player dungeon. Walk over colored switches to trigger random traps 
 - Some switches help you (heal). Some hurt both (shock). The trick is learning what each color does before your opponent does.
 - Last one alive wins.
 
-## Controls
+## Controls (Brawl Stars-style dual joystick)
 
-- **Touch:** drag anywhere on screen — virtual joystick (the further you drag from the start point, the faster you move)
-- **Desktop:** WASD or arrow keys
+- **Touch — left half of screen:** drag = move (blue joystick)
+- **Touch — right half of screen:** drag = aim and fire continuously (orange joystick); just touch to fire forward
+- **Bumping** the other player shoves them — push them onto a spike tile or into the blade!
+- **Desktop:** WASD or arrows to move, F or Space to attack
+
+## Match format
+
+Best of 5 — first to 3 round wins takes the match. Round score shown as pips at the top of the screen.
 
 ## Running Locally
 
